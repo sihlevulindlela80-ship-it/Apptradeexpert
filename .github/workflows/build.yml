@@ -1,0 +1,1009 @@
+name: Build TRADE EXPERT EA APK
+on:
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: "Your app link"
+        required: true
+        default: "https://tradeexpertea.com/ea-app"
+      app_name:
+        description: "App name"
+        required: true
+        default: "TRADE EXPERT EA"
+      icon_url:
+        description: "Icon image link (optional - leave empty to use the icon of your app link)"
+        required: false
+        default: ""
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      APP_URL: ${{ inputs.app_url }}
+      APP_NAME: ${{ inputs.app_name }}
+      ICON_URL: ${{ inputs.icon_url }}
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Create app from link
+        working-directory: .
+        run: |
+          mkdir -p app/www
+          cd app
+          echo '<!doctype html><title>TradeExpert</title>' > www/index.html
+          npm init -y > /dev/null
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          node -e "require('fs').writeFileSync('capacitor.config.json', JSON.stringify({appId:'com.tradeexpert.app',appName:process.env.APP_NAME,webDir:'www',server:{url:process.env.APP_URL,cleartext:false}},null,2))"
+          npx cap add android
+      - name: Install floating overlay
+        run: |
+          PKG=$(grep -ohP "appId[\"']?\s*:\s*[\"']\K[^\"']+" capacitor.config.* | head -1)
+          [ -z "$PKG" ] && { echo "appId not found"; exit 1; }
+          DIR="android/app/src/main/java/$(echo $PKG | tr . /)"
+          mkdir -p "$DIR" android/app/src/main/res/drawable android/app/src/main/assets
+          cat > "$DIR/FloatingBubblePlugin.java" <<'EOF'
+          package __PKG__;
+
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.provider.Settings;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @CapacitorPlugin(name = "FloatingBubble")
+          public class FloatingBubblePlugin extends Plugin {
+
+              @Override
+              public void load() {
+                  OverlayService.listener = new OverlayService.Listener() {
+                      @Override public void onAction(String id, String action) {
+                          JSObject o = new JSObject();
+                          o.put("id", id);
+                          o.put("action", action);
+                          notifyListeners("overlayAction", o);
+                      }
+                  };
+              }
+
+              @PluginMethod
+              public void hasPermission(PluginCall call) {
+                  JSObject r = new JSObject();
+                  r.put("granted", Settings.canDrawOverlays(getContext()));
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void requestPermission(PluginCall call) {
+                  Context c = getContext();
+                  if (!Settings.canDrawOverlays(c)) {
+                      Intent i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + c.getPackageName()));
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      c.startActivity(i);
+                  }
+                  call.resolve();
+              }
+
+              /** Add / update one EA (bot) and open its panel. Call once per EA you start. */
+              @PluginMethod
+              public void show(PluginCall call) {
+                  Context c = getContext();
+                  if (!Settings.canDrawOverlays(c)) { call.reject("overlay permission not granted"); return; }
+                  Intent i = new Intent(c, OverlayService.class);
+                  i.putExtra("op", "show");
+                  i.putExtra("id", call.getString("id", "default"));
+                  i.putExtra("name", call.getString("name", ""));
+                  i.putExtra("image", call.getString("image", ""));
+                  i.putExtra("title", call.getString("title", ""));
+                  i.putExtra("online", call.getBoolean("online", true));
+                  i.putExtra("open", call.getBoolean("open", false));
+                  if (call.hasOption("size")) i.putExtra("size", call.getFloat("size", 90f));
+                  ContextCompat.startForegroundService(c, i);
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void setSize(PluginCall call) {
+                  Context c = getContext();
+                  Intent i = new Intent(c, OverlayService.class);
+                  i.putExtra("size", call.getFloat("size", 90f));
+                  ContextCompat.startForegroundService(c, i);
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void setStatus(PluginCall call) {
+                  OverlayService.setStatus(call.getString("id", "default"), call.getBoolean("online", true));
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void log(PluginCall call) {
+                  OverlayService.log(call.getString("id", "default"), call.getString("line", ""));
+                  call.resolve();
+              }
+
+              /** hide({id}) removes one EA; hide() removes everything. */
+              @PluginMethod
+              public void hide(PluginCall call) {
+                  if (call.hasOption("id")) OverlayService.hideBot(call.getString("id"));
+                  else getContext().stopService(new Intent(getContext(), OverlayService.class));
+                  call.resolve();
+              }
+          }
+          EOF
+          cat > "$DIR/OverlayService.java" <<'EOF'
+          package __PKG__;
+
+          import android.app.*;
+          import android.content.*;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.*;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.*;
+          import android.util.Base64;
+          import android.util.DisplayMetrics;
+          import android.view.*;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.*;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.ArrayList;
+          import java.util.LinkedHashMap;
+          import org.json.JSONObject;
+
+          public class OverlayService extends Service {
+              public interface Listener { void onAction(String id, String action); }
+              public static Listener listener;
+              private static OverlayService instance;
+
+              private static final String CH = "tradeexpert_overlay", LABEL = "Powered by TradeExpert";
+              private static final float MIN_DP = 36f, MAX_DP = 220f;
+
+              private static class Bot {
+                  String id, name = "", image = ""; boolean online = true;
+                  LinearLayout root; FrameLayout bubble; ImageView avatar; TextView label;
+                  WindowManager.LayoutParams lp;
+              }
+
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private final LinkedHashMap<String, Bot> bots = new LinkedHashMap<>();
+              private WindowManager wm;
+              private SharedPreferences sp;
+              private ScaleGestureDetector scaler;
+              private boolean expanded = false;
+              private String openId = null;
+              private float sizeDp = 60f;
+
+              private WebView web; private WindowManager.LayoutParams plp;
+              private float panelFrac = 0.86f;
+              private boolean ready = false;
+              private final ArrayList<String> pending = new ArrayList<>();
+
+              // ------------------------------------------------------------ static API
+              private static String q(String s) { return JSONObject.quote(s == null ? "" : s); }
+              public static void push(String js) { OverlayService s = instance; if (s != null) s.runJs(js); }
+              public static void log(String id, String line) { push("window.cotex&&cotex.log(" + q(id) + "," + q(line) + ")"); }
+              public static void setStatus(final String id, final boolean on) {
+                  final OverlayService s = instance; if (s == null) return;
+                  s.main.post(new Runnable() { public void run() {
+                      Bot b = s.bots.get(id); if (b != null) b.online = on;
+                      s.runJs("window.cotex&&cotex.setStatus(" + q(id) + "," + on + ")");
+                  }});
+              }
+              public static void hideBot(final String id) {
+                  final OverlayService s = instance; if (s == null) return;
+                  s.main.post(new Runnable() { public void run() { s.removeBot(id); } });
+              }
+
+              // -------------------------------------------------------------- lifecycle
+              @Override public IBinder onBind(Intent i) { return null; }
+              @Override public void onCreate() { super.onCreate(); instance = this; }
+
+              @Override
+              public int onStartCommand(Intent i, int flags, int startId) {
+                  startAsForeground();
+                  ensureInit();
+                  if (i == null) { if (bots.isEmpty()) stopSelf(); return START_NOT_STICKY; }
+                  if (i.hasExtra("size")) {
+                      sizeDp = clamp(i.getFloatExtra("size", sizeDp));
+                      sp.edit().putFloat("size", sizeDp).apply();
+                      for (Bot b : bots.values()) applyBubbleSize(b);
+                  }
+                  if ("show".equals(i.getStringExtra("op"))) {
+                      showBot(i.getStringExtra("id"), i.getStringExtra("name"), i.getStringExtra("image"),
+                              i.getBooleanExtra("online", true), i.getStringExtra("title"), i.getBooleanExtra("open", false));
+                  } else if (bots.isEmpty()) stopSelf();
+                  return START_NOT_STICKY;
+              }
+
+              private void ensureInit() {
+                  if (wm != null) return;
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  sp = getSharedPreferences("tradeexpert_overlay", MODE_PRIVATE);
+                  sizeDp = sp.getFloat("size", 60f);
+                  panelFrac = sp.getFloat("panel", 0.86f);
+                  scaler = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                      @Override public boolean onScale(ScaleGestureDetector d) {
+                          if (expanded && web != null) {
+                              panelFrac = Math.max(0.55f, Math.min(1.0f, panelFrac * d.getScaleFactor()));
+                              sizePanel(false);
+                              if (web.isAttachedToWindow()) wm.updateViewLayout(web, plp);
+                          } else {
+                              sizeDp = clamp(sizeDp * d.getScaleFactor());
+                              for (Bot b : bots.values()) applyBubbleSize(b);
+                          }
+                          return true;
+                      }
+                      @Override public void onScaleEnd(ScaleGestureDetector d) {
+                          sp.edit().putFloat("size", sizeDp).putFloat("panel", panelFrac).apply();
+                      }
+                  });
+              }
+
+              private void startAsForeground() {
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  Notification.Builder b;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(new NotificationChannel(CH, "Floating overlay", NotificationManager.IMPORTANCE_LOW));
+                      b = new Notification.Builder(this, CH);
+                  } else b = new Notification.Builder(this);
+                  Notification n = b.setContentTitle("TRADE EXPERT EA running").setContentText(LABEL)
+                          .setSmallIcon(getApplicationInfo().icon).setOngoing(true).build();
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+                  else startForeground(1, n);
+              }
+
+              // ------------------------------------------------------------------- bots
+              private void showBot(String id, String name, String image, boolean online, String title, boolean open) {
+                  if (id == null || id.isEmpty()) id = "default";
+                  Bot b = bots.get(id);
+                  if (b == null) { b = new Bot(); b.id = id; bots.put(id, b); buildBubble(b); }
+                  b.name = name == null ? "" : name;
+                  b.online = online;
+                  String img = image == null ? "" : image;
+                  if (!img.equals(b.image) || b.avatar.getDrawable() == null) { b.image = img; loadImage(b); }
+                  if (web == null) buildPanel();
+                  runJs("window.cotex&&cotex.open(" + q(b.id) + "," + q(b.name) + "," + q(b.image) + "," + b.online + "," + q(title) + ")");
+                  if (open) openPanel(b, title);
+                  else if (!expanded && !b.root.isAttachedToWindow()) wm.addView(b.root, b.lp);
+              }
+
+              private void removeBot(String id) {
+                  Bot b = bots.remove(id);
+                  if (b == null) return;
+                  if (b.root.isAttachedToWindow()) wm.removeView(b.root);
+                  runJs("window.cotex&&cotex.remove(" + q(id) + ")");
+                  if (bots.isEmpty()) { stopSelf(); return; }
+                  if (expanded && id.equals(openId)) collapse();
+              }
+
+              private void loadImage(final Bot b) {
+                  int def = getResources().getIdentifier("bot_avatar", "drawable", getPackageName());
+                  b.avatar.setImageResource(def);
+                  if (b.image != null && b.image.startsWith("data:image")) {
+                      try {
+                          byte[] d = Base64.decode(b.image.substring(b.image.indexOf(',') + 1), Base64.DEFAULT);
+                          Bitmap bm = BitmapFactory.decodeByteArray(d, 0, d.length);
+                          if (bm != null) b.avatar.setImageBitmap(bm);
+                      } catch (Exception ignored) {}
+                      return;
+                  }
+                  if (b.image == null || !b.image.startsWith("http")) return;
+                  final String url = b.image;
+                  new Thread(new Runnable() { public void run() {
+                      Bitmap bmp = null;
+                      try {
+                          HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                          c.setConnectTimeout(8000); c.setReadTimeout(8000);
+                          InputStream in = c.getInputStream();
+                          bmp = BitmapFactory.decodeStream(in);
+                          in.close();
+                      } catch (Exception ignored) {}
+                      final Bitmap fb = bmp;
+                      main.post(new Runnable() { public void run() {
+                          if (fb != null && bots.get(b.id) == b && url.equals(b.image)) b.avatar.setImageBitmap(fb);
+                      }});
+                  }}).start();
+              }
+
+              // ------------------------------------------------------------------ panel
+              private void buildPanel() {
+                  web = new WebView(this);
+                  web.setBackgroundColor(Color.TRANSPARENT);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  web.addJavascriptInterface(new Bridge(), "Android");
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override public void onPageFinished(WebView v, String url) {
+                          ready = true;
+                          for (String js : pending) v.evaluateJavascript(js, null);
+                          pending.clear();
+                      }
+                  });
+
+                  plp = new WindowManager.LayoutParams(-2, -2, overlayType(),
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                          PixelFormat.TRANSLUCENT);
+                  plp.gravity = Gravity.TOP | Gravity.START;
+                  plp.x = sp.getInt("px", -1);
+                  plp.y = sp.getInt("py", getResources().getDisplayMetrics().heightPixels / 5);
+                  sizePanel(plp.x < 0);
+
+                  web.setOnTouchListener(new View.OnTouchListener() {
+                      boolean dragging; float tx, ty; int sx, sy;
+                      @Override public boolean onTouch(View v, MotionEvent e) {
+                          scaler.onTouchEvent(e);
+                          float unit = plp.width / 360f;
+                          switch (e.getActionMasked()) {
+                              case MotionEvent.ACTION_DOWN:
+                                  dragging = e.getY() < 44 * unit && e.getX() < plp.width - 48 * unit;
+                                  if (dragging) { sx = plp.x; sy = plp.y; tx = e.getRawX(); ty = e.getRawY(); }
+                                  return dragging;
+                              case MotionEvent.ACTION_MOVE:
+                                  if (dragging && e.getPointerCount() == 1 && !scaler.isInProgress()) {
+                                      plp.x = sx + (int) (e.getRawX() - tx);
+                                      plp.y = sy + (int) (e.getRawY() - ty);
+                                      wm.updateViewLayout(web, plp);
+                                  }
+                                  return dragging;
+                              case MotionEvent.ACTION_UP:
+                              case MotionEvent.ACTION_CANCEL:
+                                  if (dragging) {
+                                      dragging = false;
+                                      sp.edit().putInt("px", plp.x).putInt("py", plp.y).apply();
+                                      return true;
+                                  }
+                                  return false;
+                          }
+                          return false;
+                      }
+                  });
+                  web.loadUrl("file:///android_asset/overlay.html");
+              }
+
+              private void sizePanel(boolean center) {
+                  DisplayMetrics dm = getResources().getDisplayMetrics();
+                  int w = Math.round(dm.widthPixels * panelFrac), h = Math.round(w * 400f / 360f);
+                  if (h > dm.heightPixels * 0.9f) { h = Math.round(dm.heightPixels * 0.9f); w = Math.round(h * 360f / 400f); }
+                  plp.width = w; plp.height = h;
+                  if (center) plp.x = (dm.widthPixels - w) / 2;
+                  plp.x = Math.max(0, Math.min(plp.x, dm.widthPixels - w));
+                  plp.y = Math.max(0, Math.min(plp.y, dm.heightPixels - h));
+              }
+
+              private void openPanel(Bot b, String title) {
+                  for (Bot x : bots.values()) if (x.root.isAttachedToWindow()) wm.removeView(x.root);
+                  openId = b.id;
+                  runJs("window.cotex&&cotex.open(" + q(b.id) + "," + q(b.name) + "," + q(b.image) + "," + b.online + "," + q(title) + ")");
+                  sizePanel(false);
+                  if (!web.isAttachedToWindow()) wm.addView(web, plp);
+                  expanded = true;
+              }
+
+              private void collapse() {
+                  if (web != null && web.isAttachedToWindow()) wm.removeView(web);
+                  expanded = false;
+                  for (Bot b : bots.values()) {
+                      applyBubbleSize(b);
+                      if (!b.root.isAttachedToWindow()) wm.addView(b.root, b.lp);
+                  }
+              }
+
+              private class Bridge {
+                  @JavascriptInterface public void collapse() { main.post(new Runnable() { public void run() { OverlayService.this.collapse(); } }); }
+                  @JavascriptInterface public void action(final String id, final String a) {
+                      main.post(new Runnable() { public void run() {
+                          Bot b = bots.get(id);
+                          if (b != null) { if ("start".equals(a)) b.online = true; if ("stop".equals(a)) b.online = false; }
+                          if ("stop".equals(a)) removeBot(id);
+                      }});
+                      Listener l = listener; if (l != null) l.onAction(id, a);
+                  }
+              }
+
+              private void runJs(final String js) {
+                  main.post(new Runnable() { public void run() {
+                      if (web == null) return;
+                      if (ready) web.evaluateJavascript(js, null); else pending.add(js);
+                  }});
+              }
+
+              // ----------------------------------------------------------------- bubble
+              private void buildBubble(final Bot b) {
+                  int idx = bots.size() - 1;
+                  b.root = new LinearLayout(this);
+                  b.root.setOrientation(LinearLayout.VERTICAL);
+                  b.root.setGravity(Gravity.CENTER_HORIZONTAL);
+
+                  b.bubble = new FrameLayout(this);
+                  b.avatar = new ImageView(this);
+                  b.avatar.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                  b.avatar.setOutlineProvider(new ViewOutlineProvider() {
+                      @Override public void getOutline(View v, Outline o) { o.setOval(0, 0, v.getWidth(), v.getHeight()); }
+                  });
+                  b.avatar.setClipToOutline(true);
+                  b.bubble.addView(b.avatar, new FrameLayout.LayoutParams(-1, -1));
+
+                  b.label = new TextView(this);
+                  b.label.setText(LABEL);
+                  b.label.setTextColor(0xFF6FA8FF);
+                  b.label.setTypeface(Typeface.MONOSPACE);
+                  b.label.setGravity(Gravity.CENTER);
+                  b.label.setShadowLayer(8f, 0, 0, 0xFF000000);
+                  b.root.addView(b.bubble);
+                  b.root.addView(b.label, new LinearLayout.LayoutParams(-2, -2));
+
+                  b.lp = new WindowManager.LayoutParams(-2, -2, overlayType(),
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                          PixelFormat.TRANSLUCENT);
+                  b.lp.gravity = Gravity.TOP | Gravity.START;
+                  b.lp.x = sp.getInt("bx_" + b.id, 40);
+                  b.lp.y = sp.getInt("by_" + b.id, 300 + idx * dp(sizeDp + 34));
+
+                  b.root.setOnTouchListener(new View.OnTouchListener() {
+                      int sx, sy; float tx, ty; boolean moved, rebase;
+                      @Override public boolean onTouch(View v, MotionEvent e) {
+                          scaler.onTouchEvent(e);
+                          if (scaler.isInProgress()) { moved = true; return true; }
+                          switch (e.getActionMasked()) {
+                              case MotionEvent.ACTION_DOWN:
+                                  sx = b.lp.x; sy = b.lp.y; tx = e.getRawX(); ty = e.getRawY(); moved = false; rebase = false;
+                                  return true;
+                              case MotionEvent.ACTION_POINTER_UP:
+                                  rebase = true; return true;
+                              case MotionEvent.ACTION_MOVE:
+                                  if (e.getPointerCount() != 1) return true;
+                                  if (rebase) { sx = b.lp.x; sy = b.lp.y; tx = e.getRawX(); ty = e.getRawY(); rebase = false; }
+                                  float dx = e.getRawX() - tx, dy = e.getRawY() - ty;
+                                  if (Math.abs(dx) > 12 || Math.abs(dy) > 12) moved = true;
+                                  if (moved) { b.lp.x = sx + (int) dx; b.lp.y = sy + (int) dy; wm.updateViewLayout(b.root, b.lp); }
+                                  return true;
+                              case MotionEvent.ACTION_UP:
+                                  if (!moved) openPanel(b, null);
+                                  else sp.edit().putInt("bx_" + b.id, b.lp.x).putInt("by_" + b.id, b.lp.y).apply();
+                                  return true;
+                          }
+                          return false;
+                      }
+                  });
+                  applyBubbleSize(b);
+              }
+
+              private void applyBubbleSize(Bot b) {
+                  int px = dp(sizeDp), ring = Math.max(dp(2), Math.round(px * 0.04f)), pad = Math.round(px * 0.07f);
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setShape(GradientDrawable.OVAL);
+                  bg.setColor(0xFF03070D);
+                  bg.setStroke(ring, 0xFF2F7BE0);
+                  b.bubble.setBackground(bg);
+                  b.bubble.setPadding(pad, pad, pad, pad);
+                  b.bubble.setLayoutParams(new LinearLayout.LayoutParams(px, px));
+                  b.label.setTextSize(Math.max(7f, sizeDp / 10f));
+                  if (b.root.isAttachedToWindow()) wm.updateViewLayout(b.root, b.lp);
+              }
+
+              // ---------------------------------------------------------------- helpers
+              private int overlayType() {
+                  return Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                          : WindowManager.LayoutParams.TYPE_PHONE;
+              }
+              private float clamp(float v) { return Math.max(MIN_DP, Math.min(MAX_DP, v)); }
+              private int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+              @Override
+              public void onDestroy() {
+                  try { if (web != null && web.isAttachedToWindow()) wm.removeView(web); } catch (Exception ignored) {}
+                  for (Bot b : bots.values()) { try { if (b.root.isAttachedToWindow()) wm.removeView(b.root); } catch (Exception ignored) {} }
+                  bots.clear();
+                  if (web != null) web.destroy();
+                  web = null; instance = null; ready = false; expanded = false;
+                  super.onDestroy();
+              }
+          }
+          EOF
+          cat > "$DIR/MainActivity.java" <<'EOF'
+          package __PKG__;
+
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import android.widget.Toast;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.BridgeActivity;
+          import com.getcapacitor.BridgeWebViewClient;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+
+          public class MainActivity extends BridgeActivity {
+              private static boolean asked = false;
+              private String hookJs = "";
+
+              private class TEBridge {
+                  @JavascriptInterface public boolean hasPermission() { return Settings.canDrawOverlays(MainActivity.this); }
+
+                  @JavascriptInterface public void requestPermission() {
+                      runOnUiThread(new Runnable() { public void run() { openOverlaySettings(); } });
+                  }
+
+                  @JavascriptInterface public void show(String id, String name, String image) {
+                      if (!Settings.canDrawOverlays(MainActivity.this)) return;
+                      Intent i = new Intent(MainActivity.this, OverlayService.class);
+                      i.putExtra("op", "show");
+                      i.putExtra("id", id);
+                      i.putExtra("name", name);
+                      i.putExtra("image", image == null ? "" : image);
+                      i.putExtra("title", "");
+                      i.putExtra("online", true);
+                      i.putExtra("open", false);
+                      ContextCompat.startForegroundService(MainActivity.this, i);
+                  }
+
+                  @JavascriptInterface public void setStatus(String id, boolean online) { OverlayService.setStatus(id, online); }
+                  @JavascriptInterface public void log(String id, String line) { OverlayService.log(id, line); }
+                  @JavascriptInterface public void hide(String id) { OverlayService.hideBot(id); }
+              }
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(FloatingBubblePlugin.class);
+                  super.onCreate(savedInstanceState);
+                  hookJs = readAsset("te-hook.js");
+                  getBridge().getWebView().addJavascriptInterface(new TEBridge(), "TEAndroid");
+                  getBridge().setWebViewClient(new BridgeWebViewClient(getBridge()) {
+                      @Override public void onPageFinished(WebView v, String url) {
+                          super.onPageFinished(v, url);
+                          if (!hookJs.isEmpty()) v.evaluateJavascript(hookJs, null);
+                      }
+                  });
+              }
+
+              @Override
+              public void onResume() {
+                  super.onResume();
+                  if (!asked && !Settings.canDrawOverlays(this)) {
+                      asked = true;
+                      openOverlaySettings();
+                  }
+              }
+
+              private void openOverlaySettings() {
+                  Toast.makeText(this, "Allow \"Display over other apps\" for TRADE EXPERT EA", Toast.LENGTH_LONG).show();
+                  startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
+              }
+
+              private String readAsset(String name) {
+                  try {
+                      InputStream in = getAssets().open(name);
+                      ByteArrayOutputStream out = new ByteArrayOutputStream();
+                      byte[] buf = new byte[4096]; int n;
+                      while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                      in.close();
+                      return out.toString("UTF-8");
+                  } catch (Exception e) { return ""; }
+              }
+          }
+          EOF
+          sed -i "s/__PKG__/$PKG/g" "$DIR/FloatingBubblePlugin.java" "$DIR/OverlayService.java" "$DIR/MainActivity.java"
+          cat > android/app/src/main/assets/overlay.html <<'EOF'
+          <!doctype html>
+          <html><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+          <style>
+          *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+          html,body{background:transparent;overflow:hidden;width:100%;height:100%;font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace}
+          #wrap{position:absolute;left:0;top:0;width:360px;height:400px;transform-origin:0 0}
+          .panel{position:absolute;left:0;top:0;width:360px;height:372px;border-radius:14px;border:1px solid #17304f;
+            background:rgba(4,8,13,.96);box-shadow:0 0 0 1px #0a1522,inset 0 0 40px rgba(20,60,110,.22)}
+          .c{position:absolute;width:13px;height:13px;border:2px solid #1d4372}
+          .tl{top:8px;left:8px;border-right:0;border-bottom:0;border-radius:3px 0 0 0}
+          .tr{top:8px;right:8px;border-left:0;border-bottom:0;border-radius:0 3px 0 0}
+          .bl{bottom:8px;left:8px;border-right:0;border-top:0;border-radius:0 0 0 3px}
+          .br{bottom:8px;right:8px;border-left:0;border-top:0;border-radius:0 0 3px 0}
+          .hd{height:44px;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 24px;border-bottom:1px solid #10233a}
+          .dots{display:grid;grid-template-columns:repeat(3,5px);gap:4px}
+          .dots i{width:5px;height:5px;border-radius:50%;background:#2b5f94}
+          .ttl{color:#2b5f94;letter-spacing:3px;font-size:13px}
+          .x{width:32px;height:32px;border-radius:50%;border:2px solid #1d4372;color:#2b5f94;display:flex;align-items:center;justify-content:center;font-size:15px;background:transparent}
+          .banner{position:relative;margin:12px 14px 0;height:100px;border-radius:10px;border:1px solid #17304f;overflow:hidden;
+            background:linear-gradient(135deg,#0a1a2e,#05090e)}
+          .pill{position:absolute;top:9px;left:9px;display:flex;align-items:center;gap:6px;border:1px solid #1d4372;border-radius:16px;padding:3px 10px;
+            font-size:10px;letter-spacing:2px;color:#2b5f94;background:rgba(3,7,12,.7)}
+          .pill b{width:7px;height:7px;border-radius:50%;background:#2b5f94;display:block}
+          .pill.on{color:#35e0a1;border-color:#1a6e55}.pill.on b{background:#35e0a1;box-shadow:0 0 6px #35e0a1}
+          .name{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:22px;font-weight:700;letter-spacing:2px;text-shadow:0 0 12px #000;text-transform:uppercase;text-align:center;padding:0 14px}
+          .btns{display:flex;gap:10px;margin:12px 14px 0}
+          .btns button{flex:1;height:46px;border:0;border-radius:12px;background:#264f7d;color:#0f2540;font:inherit;font-size:11px;letter-spacing:3px;display:flex;align-items:center;justify-content:center;gap:8px}
+          .btns button:active{filter:brightness(1.25)}
+          .dot{width:8px;height:8px;border-radius:50%;background:#0f2540;display:inline-block}
+          .live .dot{background:#35e0a1}
+          .con{margin:12px 14px 0;height:128px;border:1px solid #10233a;border-radius:10px;background:#02050a;display:flex;flex-direction:column;overflow:hidden}
+          .ch{display:flex;justify-content:space-between;padding:11px 16px;border-bottom:1px solid #10233a;font-size:10px;letter-spacing:2px;color:#1f4a78}
+          #log{flex:1;overflow-y:auto;padding:10px 16px;font-size:12px;letter-spacing:1px;color:#2b5f94;line-height:1.5;word-break:break-word}
+          #log .buy{color:#35e0a1}#log .sell{color:#ff6b78}#log .sig{color:#6fa8ff}
+          .pw{position:absolute;left:0;top:378px;width:360px;text-align:center;font-size:13px;letter-spacing:1px;color:#8793a0}
+          .pw span{color:#2f7bd6}
+          </style></head><body>
+          <div id="wrap">
+            <div class="panel">
+              <div class="c tl"></div><div class="c tr"></div><div class="c bl"></div><div class="c br"></div>
+              <div class="hd">
+                <div class="dots"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+                <div class="ttl" id="title">TrapGoat</div>
+                <button class="x" onclick="Android.collapse()">&#x2715;</button>
+              </div>
+              <div class="banner" id="banner">
+                <div class="pill" id="pill"><b></b><span id="pt">OFFLINE</span></div>
+                <div class="name" id="bname"></div>
+              </div>
+              <div class="btns">
+                <button id="bStop">STOP EA</button>
+                <button id="bScript">SCRIPT</button>
+                <button id="bLive" class="live"><span class="dot"></span>LIVE</button>
+              </div>
+              <div class="con"><div class="ch"><span>EA CONSOLE</span><span>SCRIPT</span></div><div id="log"></div></div>
+            </div>
+            <div class="pw">Powered by <span>TradeExpert</span></div>
+          </div>
+          <script>
+          var S={},cur=null;
+          function $(i){return document.getElementById(i)}
+          function send(a){ if(window.Android&&cur!==null) Android.action(cur,a); }
+          function fit(){ $('wrap').style.transform='scale('+(window.innerWidth/360)+')'; }
+          addEventListener('resize',fit); fit();
+          function render(){
+            var s=S[cur]; if(!s) return;
+            $('bname').textContent=s.name||'EA'; $('bname').style.fontSize=((s.name||'').length>16?16:22)+'px';
+            $('banner').style.backgroundImage=s.img?"linear-gradient(rgba(0,0,0,.5),rgba(0,0,0,.5)),url('"+s.img.replace(/'/g,'%27')+"')":"linear-gradient(135deg,#0a1a2e,#05090e)";
+            $('pill').className='pill'+(s.on?' on':''); $('pt').textContent=s.on?'ONLINE':'OFFLINE';
+            $('bStop').textContent=s.on?'STOP EA':'START EA';
+            var l=$('log'); l.innerHTML='';
+            s.logs.forEach(function(t){ var d=document.createElement('div'); d.textContent='> '+t; d.className=/\bBUY\b/i.test(t)?'buy':/\bSELL\b/i.test(t)?'sell':/SIGNAL|TRADE/i.test(t)?'sig':''; l.appendChild(d); });
+            l.scrollTop=l.scrollHeight;
+          }
+          function sysLine(on){ return '[SYS] ENGINE '+(on?'STARTED :: SCANNING':'STOPPED :: STANDBY'); }
+          var cotex={
+            open:function(id,name,img,online,title){
+              var s=S[id]||(S[id]={logs:[]}); var changed=(s.on!==!!online);
+              s.name=name; s.img=img; s.on=!!online; cur=id;
+              if(!s.logs.length||changed) s.logs.push(sysLine(s.on));
+              if(title) $('title').textContent=title; render(); },
+            setStatus:function(id,o){ var s=S[id]; if(!s) return; if(s.on!==!!o){ s.on=!!o; s.logs.push(sysLine(s.on)); } if(id===cur) render(); },
+            log:function(id,t){ var s=S[id]; if(!s) return; s.logs.push(t); if(s.logs.length>200) s.logs.shift(); if(id===cur) render(); },
+            remove:function(id){ delete S[id]; if(cur===id) cur=null; }
+          };
+          $('bStop').onclick=function(){ var s=S[cur]; if(!s) return; cotex.setStatus(cur,!s.on); send(s.on?'start':'stop'); };
+          $('bScript').onclick=function(){ if(cur===null) return; cotex.log(cur,'[SYS] SCRIPT REQUESTED'); send('script'); };
+          $('bLive').onclick=function(){ this.classList.toggle('live'); send('live'); };
+          </script></body></html>
+          EOF
+          cat > android/app/src/main/assets/te-hook.js <<'EOF'
+          (function () {
+            if (window.__teHook) return;
+            window.__teHook = true;
+            var waiting = null, cur = null, known = {}, pend = null, askedAt = 0;
+
+            function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+            function slug(s) { return (s || 'ea').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'ea'; }
+
+            // Native bridge: direct interface first, Capacitor plugin as backup.
+            function api() {
+              var T = window.TEAndroid;
+              if (T) return {
+                perm: function () { return Promise.resolve(T.hasPermission()); },
+                ask: function () { T.requestPermission(); },
+                show: function (b) { T.show(b.id, b.name, b.image || ''); },
+                status: function (id, on) { T.setStatus(id, on); },
+                hide: function (id) { T.hide(id); },
+                log: function (id, line) { T.log(id, line); }
+              };
+              var f = window.Capacitor && Capacitor.Plugins && Capacitor.Plugins.FloatingBubble;
+              if (f) return {
+                perm: function () { return f.hasPermission().then(function (r) { return r.granted; }); },
+                ask: function () { return f.requestPermission(); },
+                show: function (b) { return f.show({ id: b.id, name: b.name, image: b.image || '', online: true, open: false }); },
+                status: function (id, on) { return f.setStatus({ id: id, online: on }); },
+                hide: function (id) { return f.hide({ id: id }); },
+                log: function (id, line) { return f.log({ id: id, line: line }); }
+              };
+              return null;
+            }
+
+            // Optional: window.TEOverlay = {name, image}, or data-ea-name / data-ea-image attributes.
+            function eaName() {
+              if (window.TEOverlay && window.TEOverlay.name) return window.TEOverlay.name;
+              var n = document.querySelector('[data-ea-name]');
+              if (n) return clean(n.textContent);
+              var h = document.querySelector('h1,h2,h3');
+              return h ? clean(h.textContent) : (document.title || 'EA');
+            }
+            function toData(im) {
+              try {
+                var c = document.createElement('canvas'); c.width = c.height = 256;
+                var x = c.getContext('2d'), k = Math.max(256 / im.naturalWidth, 256 / im.naturalHeight);
+                var w = im.naturalWidth * k, h = im.naturalHeight * k;
+                x.drawImage(im, (256 - w) / 2, (256 - h) / 2, w, h);
+                return c.toDataURL('image/jpeg', 0.85);
+              } catch (e) { return ''; }
+            }
+            function eaImage() {
+              if (window.TEOverlay && window.TEOverlay.image) return window.TEOverlay.image;
+              var a = document.querySelector('[data-ea-image]');
+              var best = a && a.tagName === 'IMG' ? a : null, area = 0;
+              if (!best) [].forEach.call(document.images, function (im) {
+                var r = im.getBoundingClientRect(), sz = r.width * r.height;
+                if (im.naturalWidth > 0 && sz > area) { area = sz; best = im; }
+              });
+              if (!best) return '';
+              return /^https?:/.test(best.src) ? best.src : toData(best);
+            }
+
+            // ---- Trades & signals -> floating panel console
+            var seen = {}, seenN = 0;
+            var KEY = /\b(BUY|SELL|SIGNAL|TRADE|ENTRY|OPENED|CLOSED|PENDING|TP|SL|TAKE PROFIT|STOP LOSS|PROFIT|LOSS)\b/i;
+            function pushLine(text) {
+              var A = api(); text = clean(text);
+              if (!A || !cur || !text || text.length > 200) return;
+              var now = Date.now();
+              if (seen[text] && now - seen[text] < 60000) return;      // ignore re-renders of the same line
+              if (++seenN > 300) { seen = {}; seenN = 0; }
+              seen[text] = now;
+              A.log(cur, new Date().toTimeString().slice(0, 8) + ' ' + text);
+            }
+            function mirror(text) {
+              if (KEY.test(text) && /\d/.test(text) && !/\[SYS\]|^ENGINE/i.test(text)) pushLine(text);
+            }
+            function scan(el, budget) {
+              if (budget.n <= 0 || el.nodeType !== 1) return;
+              var t = clean(el.innerText || el.textContent);
+              if (!t) return;
+              if (t.length <= 200) { if (KEY.test(t) && /\d/.test(t) && !/\[SYS\]|^ENGINE/i.test(t)) { budget.n--; pushLine(t); } return; }
+              [].forEach.call(el.children, function (c) { scan(c, budget); });
+            }
+            function part(v, label) { return v === undefined || v === null || v === '' ? '' : (label ? label + ' ' : '') + v; }
+            function sendTag(tag, text) { pushLine('[' + tag + '] ' + text); }
+
+            function begin(bot) {
+              var A = api(); if (!A) return;
+              A.perm().then(function (ok) {
+                if (ok) { waiting = null; cur = bot.id; known[bot.id] = 1; A.show(bot); }
+                else {
+                  waiting = bot;
+                  if (Date.now() - askedAt > 3000) { askedAt = Date.now(); A.ask(); }  // opens "Display over other apps"
+                }
+              });
+            }
+            function retry() { if (waiting) begin(waiting); }
+            window.addEventListener('focus', retry);
+            document.addEventListener('visibilitychange', function () { if (!document.hidden) retry(); });
+
+            function stopBot(id) {
+            clearTimeout(pend); waiting = null;
+            var A = api(); id = id || cur; if (!A || !id) return;
+            A.hide(id); delete known[id]; if (cur === id) cur = null;   // bubble disappears
+          }
+            function remove() { stopBot(cur); }
+
+            // 1) Button taps (capture phase = before the app's own handler, so labels still read START/STOP)
+            document.addEventListener('click', function (e) {
+              var el = e.target, i = 0, t;
+              while (el && el !== document.body && i < 5) {
+                t = clean(el.innerText).toUpperCase();
+                if (t === 'START' || t === 'START EA') {
+                  var n = eaName(), bot = { id: slug(n), name: n, image: eaImage() };
+                  clearTimeout(pend);
+                  pend = setTimeout(function () { begin(bot); }, 1500);   // the "... STARTED" toast below gives the real name
+                  return;
+                }
+                if (t === 'STOP' || t === 'STOP EA') return stopBot(cur || slug(eaName()));
+                if (t === 'REMOVE') return remove();
+                el = el.parentElement; i++;
+              }
+            }, true);
+
+            // 2) Toast like "COTEX SNIPER EA STARTED" -> real EA name, show the bubble
+            new MutationObserver(function (ms) {
+              var budget = { n: 5 };
+              ms.forEach(function (m) {
+                [].forEach.call(m.addedNodes, function (n) {
+                  if (n.nodeType !== 1) return;
+                  scan(n, budget);
+                  [n].concat([].slice.call(n.querySelectorAll('*'))).forEach(function (el) {
+                    if (el.children.length) return;
+                    var mm = /^(.{2,40}?)\s+(STARTED|STOPPED)$/i.exec(clean(el.textContent));
+                    if (!mm || /^(\[SYS\]|>|ENGINE)/i.test(mm[1])) return;
+                    var name = clean(mm[1]), id = slug(name);
+                    if (/started/i.test(mm[2])) { clearTimeout(pend); begin({ id: id, name: name, image: eaImage() }); }
+                    else stopBot(known[id] ? id : cur);
+                  });
+                });
+              });
+            }).observe(document.body, { childList: true, subtree: true });
+
+            // Optional explicit API for the web app
+            window.TEOverlay = window.TEOverlay || {};
+            window.TEOverlay.start = function (o) { o = o || {}; var n = o.name || eaName(); begin({ id: slug(n), name: n, image: o.image || eaImage() }); };
+            window.TEOverlay.stop = function () { stopBot(cur); };
+            window.TEOverlay.remove = remove;
+            window.TEOverlay.log = function (text) { pushLine(String(text)); };
+            window.TEOverlay.signal = function (o) {
+              if (typeof o === 'string') return sendTag('SIGNAL', o);
+              sendTag('SIGNAL', [o.side, o.symbol, part(o.price, '@'), part(o.sl, 'SL'), part(o.tp, 'TP')].filter(Boolean).join(' '));
+            };
+            window.TEOverlay.trade = function (o) {
+              if (typeof o === 'string') return sendTag('TRADE', o);
+              sendTag('TRADE', [o.action, o.side, o.symbol, part(o.lots, '') && o.lots + ' lots', part(o.price, '@'), part(o.profit, 'P/L')].filter(Boolean).join(' '));
+            };
+          })();
+          EOF
+          cat > android/app/src/main/res/drawable/bot_avatar.xml <<'EOF'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <gradient android:angle="90" android:startColor="#05090E" android:endColor="#1E5AA8"/>
+          </shape>
+          EOF
+          python3 - "$PKG" <<'PY'
+          import sys
+          pkg=sys.argv[1]; p='android/app/src/main/AndroidManifest.xml'; s=open(p).read()
+          if 'OverlayService' not in s:
+              perms='''    <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+          '''
+              svc='''        <service android:name="%s.OverlayService" android:exported="false" android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FOREGROUND_SERVICE_SUBTYPE" android:value="floating_overlay"/>
+                  </service>
+          ''' % pkg
+              s=s.replace('<application',perms+'    <application',1)
+              s=s.replace('</application>',svc+'    </application>',1)
+              open(p,'w').write(s)
+          PY
+          sed -i 's#<string name="app_name">[^<]*</string>#<string name="app_name">TRADE EXPERT EA</string>#; s#<string name="title_activity_main">[^<]*</string>#<string name="title_activity_main">TRADE EXPERT EA</string>#' android/app/src/main/res/values/strings.xml
+      - name: Set app icon
+        run: |
+          python3 -m venv /tmp/iconvenv
+          /tmp/iconvenv/bin/pip install -q pillow
+          /tmp/iconvenv/bin/python - <<'PY'
+          import os, io, sys, json, base64, urllib.request, urllib.parse
+          from html.parser import HTMLParser
+          from PIL import Image, ImageDraw
+
+          APP = os.environ['APP_URL']
+          OVR = os.environ.get('ICON_URL', '').strip()
+          # Your TRADE EXPERT EA robot icon (used unless you pass icon_url)
+          EMB = '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'
+          UA = {'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36'}
+
+          def get(u):
+              return urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=25).read()
+
+          class P(HTMLParser):
+              def __init__(s):
+                  super().__init__(); s.links = []
+              def handle_starttag(s, t, a):
+                  if t == 'link':
+                      a = dict(a); rel = (a.get('rel') or '').lower()
+                      if a.get('href') and ('icon' in rel or 'manifest' in rel):
+                          s.links.append((rel, a['href']))
+
+          cands = []
+          if OVR:
+              cands.append(OVR)
+          elif not EMB:
+              try:
+                  p = P(); p.feed(get(APP).decode('utf-8', 'ignore'))
+                  for rel, href in p.links:
+                      u = urllib.parse.urljoin(APP, href)
+                      if 'manifest' in rel:
+                          try:
+                              for i in json.loads(get(u)).get('icons', []):
+                                  cands.append(urllib.parse.urljoin(u, i['src']))
+                          except Exception as e:
+                              print('manifest:', e)
+                      else:
+                          cands.append(u)
+              except Exception as e:
+                  print('page:', e)
+              root = urllib.parse.urljoin(APP, '/')
+              cands += [root + 'apple-touch-icon.png', root + 'icon-512.png', root + 'favicon.png', root + 'favicon.ico']
+
+          best = None
+          if EMB and not OVR:
+              best = (Image.open(io.BytesIO(base64.b64decode(EMB))).convert('RGBA'), 'embedded icon')
+          for u in cands:
+              try:
+                  im = Image.open(io.BytesIO(get(u))); im.load(); im = im.convert('RGBA')
+                  print('candidate', u, im.size)
+                  if best is None or im.width * im.height > best[0].width * best[0].height:
+                      best = (im, u)
+              except Exception as e:
+                  print('skip', u, e)
+          if not best:
+              print('::warning::No icon found on the app link - keeping the default icon. Pass icon_url to set one.')
+              sys.exit(0)
+          src, url = best
+          print('using icon', url, src.size)
+          if src.width < 192:
+              print('::warning::Icon is only %dpx wide, it will look soft. Pass a bigger icon_url.' % src.width)
+
+          c = src.getpixel((1, 1))
+          bg = (c[0], c[1], c[2]) if c[3] > 200 else (5, 9, 14)
+          res = 'android/app/src/main/res'
+
+          def trim(im):
+              w, h = im.size
+              mask = Image.new('L', (w, h), 0)
+              mask.putdata([255 if (p[3] > 20 and min(p[0], p[1], p[2]) < 240) else 0 for p in im.getdata()])
+              bb = mask.getbbox()
+              if not bb: return im
+              l, t, r, b = bb
+              side = int(max(r - l, b - t) * 1.12)
+              cx, cy = (l + r) // 2, (t + b) // 2
+              return im.crop((cx - side // 2, cy - side // 2, cx - side // 2 + side, cy - side // 2 + side))
+
+          src = trim(src)
+
+          def square(im, size, scale, fill):
+              canvas = Image.new('RGBA', (size, size), fill)
+              r = im.copy(); r.thumbnail((int(size * scale),) * 2, Image.LANCZOS)
+              canvas.alpha_composite(r, ((size - r.width) // 2, (size - r.height) // 2))
+              return canvas
+
+          for d, l, f in [('mdpi', 48, 108), ('hdpi', 72, 162), ('xhdpi', 96, 216), ('xxhdpi', 144, 324), ('xxxhdpi', 192, 432)]:
+              dd = '%s/mipmap-%s' % (res, d)
+              os.makedirs(dd, exist_ok=True)
+              for old in ('ic_launcher', 'ic_launcher_round', 'ic_launcher_foreground'):
+                  p = '%s/%s.webp' % (dd, old)
+                  if os.path.exists(p): os.remove(p)
+              a = square(src, l, 1.0, bg + (255,))
+              a.save(dd + '/ic_launcher.png')
+              m = Image.new('L', (l, l), 0); ImageDraw.Draw(m).ellipse((0, 0, l - 1, l - 1), fill=255)
+              rd = a.copy(); rd.putalpha(m); rd.save(dd + '/ic_launcher_round.png')
+              square(src, f, 0.66, (0, 0, 0, 0)).save(dd + '/ic_launcher_foreground.png')
+
+          os.makedirs(res + '/mipmap-anydpi-v26', exist_ok=True)
+          xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                 '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                 '  <background android:drawable="@color/te_icon_bg"/>\n'
+                 '  <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+                 '</adaptive-icon>\n')
+          for n in ('ic_launcher', 'ic_launcher_round'):
+              open('%s/mipmap-anydpi-v26/%s.xml' % (res, n), 'w').write(xml)
+          os.makedirs(res + '/values', exist_ok=True)
+          open(res + '/values/te_icon.xml', 'w').write(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources><color name="te_icon_bg">#%02X%02X%02X</color></resources>\n' % bg)
+          PY
+      - name: Set app name
+        run: |
+          python3 - <<'PY'
+          import os,re
+          p='android/app/src/main/res/values/strings.xml'; s=open(p).read(); n=os.environ['APP_NAME']
+          s=re.sub(r'(<string name="app_name">)[^<]*',lambda m:m.group(1)+n,s)
+          s=re.sub(r'(<string name="title_activity_main">)[^<]*',lambda m:m.group(1)+n,s)
+          open(p,'w').write(s)
+          PY
+      - name: Sync
+        run: npx cap sync android
+      - name: Build APK
+        run: cd android && chmod +x gradlew && ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TRADE-EXPERT-EA-apk
+          path: app/android/app/build/outputs/apk/debug/app-debug.apk
